@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { exec } from 'node:child_process'
 import readline from 'node:readline'
+import fs from 'node:fs'
 
 import { Anthropic } from '@anthropic-ai/sdk'
 import dotenv from 'dotenv'
@@ -32,10 +33,90 @@ const TOOLS = [
       },
       required: ['command']
     }
+  },
+  {
+    name: 'read_file',
+    description: 'Read file content.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        limit: { type: 'integer' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'write_file',
+    description: 'Write content to file.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        content: { type: 'string' }
+      },
+      required: ['path', 'content']
+    }
+  },
+  {
+    name: 'edit_file',
+    description: 'Replace exact text in file.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        old_content: { type: 'string' },
+        new_content: { type: 'string' }
+      },
+      required: ['path', 'old_content', 'new_content']
+    }
   }
 ]
 
+function filePathFromInput(input) {
+  return input?.path ?? input?.filePath ?? input?.file_path
+}
+
+const TOOL_HANDLERS = {
+  bash: (input) => runBash(input.command),
+  read_file: (input) => {
+    const p = filePathFromInput(input)
+    if (p == null || String(p).trim() === '') {
+      return 'Error: read_file requires a non-empty path.'
+    }
+    return runRead(p, input?.limit)
+  },
+  write_file: (input) => {
+    const p = filePathFromInput(input)
+    if (p == null || String(p).trim() === '') {
+      return 'Error: write_file requires a non-empty path.'
+    }
+    return runWrite(p, input.content)
+  },
+  edit_file: (input) => {
+    const p = filePathFromInput(input)
+    if (p == null || String(p).trim() === '') {
+      return 'Error: edit_file requires a non-empty path.'
+    }
+    return runEdit(p, input.old_content ?? input.oldContent, input.new_content ?? input.newContent)
+  }
+}
+
 const DANGEROUS = ['rm -rf /', 'sudo', 'shutdown', 'reboot', '> /dev/']
+
+/**
+ * 确保path在currentDir下
+ * @param {string} p
+ * @returns {string} 绝对路径
+ */
+function safePath(p) {
+  const absolutePath = path.resolve(currentDir, p)
+  const relativePath = path.relative(currentDir, absolutePath)
+  if (relativePath.startsWith('..') || (path.isAbsolute(relativePath) && !relativePath)) {
+    throw new Error(`Error: Path escapes workspace: ${p}.`)
+  }
+  return absolutePath
+}
 
 /**
  * 允许shell命令，会拦截危险命令，处理超时、输出截断
@@ -53,7 +134,7 @@ function runBash(command) {
       command,
       {
         shell: true,
-        cwd: process.cwd(),
+        cwd: currentDir,
         timeout: 120000,
         maxBuffer: 500000 * 4
       },
@@ -81,7 +162,69 @@ function runBash(command) {
   })
 }
 
-// 核心：while循环调用工具，直到模型返回停止
+/**
+ * 读文件
+ * @param {string} filePath
+ * @param {number | undefined} limit
+ * @returns {string}
+ */
+function runRead(filePath, limit) {
+  try {
+    const absolutePath = safePath(filePath)
+    const content = fs.readFileSync(absolutePath, 'utf8')
+    let lines = content.split(/\r?\n/)
+
+    if (limit && limit < lines.length) {
+      const more = lines.length - limit
+      lines = lines.slice(0, limit)
+      lines.push(`... (${more} more lines)`)
+    }
+
+    return lines.join('\n').slice(0, 50000)
+  } catch (error) {
+    return `Error: ${error.message}`
+  }
+}
+/**
+ * 写文件
+ * @param {string} filePath
+ * @param {string} content
+ * @returns {string}
+ */
+function runWrite(filePath, content) {
+  try {
+    const absolutePath = safePath(filePath)
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true })
+    fs.writeFileSync(absolutePath, content, 'utf8')
+    return `Wrote ${content.length} bytes to ${filePath}.`
+  } catch (error) {
+    return `Error: ${error.message}`
+  }
+}
+/**
+ * 编辑文件。将旧文件替换为新文件，只替换一次
+ * @param {string} filePath
+ * @param {string} oldContent
+ * @param {string} newContent
+ * @returns {string}
+ */
+function runEdit(filePath, oldContent, newContent) {
+  try {
+    const absolutePath = safePath(filePath)
+    const content = fs.readFileSync(absolutePath, 'utf8')
+    if (!content.includes(oldContent)) {
+      return `Error: ${oldContent} not found in ${filePath}.`
+    }
+
+    const updatedContent = content.replace(oldContent, newContent)
+    fs.writeFileSync(absolutePath, updatedContent, 'utf8')
+    return `Edited ${filePath}.`
+  } catch (error) {
+    return `Error: ${error.message}`
+  }
+}
+
+// !!!核心：while循环调用工具，直到模型返回停止
 async function agentLoop(messages) {
   console.log('messages===========', messages)
   while (true) {
@@ -114,15 +257,16 @@ async function agentLoop(messages) {
     const results = []
     for (const block of response.content) {
       if (block.type === 'tool_use') {
-        const command = block.input.command
-        // type: 'tool_use',
-        // id: 'call_00_5Y8iIRfppKpuvWfAIVDINNLE',
-        // name: 'bash',
-        // input: { command: 'ls -l' }
-        console.log('执行命令===========', command)
-        const output = await runBash(command)
+        const handler = TOOL_HANDLERS[block.name]
+        let output
+        if (handler) {
+          output = await handler(block.input)
+        } else {
+          output = `Error: Unknown tool: ${block.name}.`
+        }
 
-        console.log('执行命令后的输入：：：：', output)
+        console.log(`> ${block.name}: ${String(output).slice(0, 200)}`)
+
         results.push({
           type: 'tool_result',
           tool_use_id: block.id,
@@ -131,7 +275,6 @@ async function agentLoop(messages) {
       }
     }
 
-    console.log('results===========', results)
     messages.push({
       role: 'user',
       content: results
@@ -178,6 +321,7 @@ async function main() {
       console.log()
     } catch (error) {
       console.error('Error:', error)
+      console.log()
     }
     rl.prompt()
   })
